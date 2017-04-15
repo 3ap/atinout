@@ -31,18 +31,21 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <getopt.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define MAX_LINE_LENGTH (4 * 1024)
 static char buf[MAX_LINE_LENGTH];
-static char buf2[MAX_LINE_LENGTH];
+static int timeout = 5;
 
 static struct option long_options[] = {
 	{"help", no_argument, NULL, 'h'},
 	{"version", no_argument, NULL, 'V'},
+	{"timeout", no_argument, NULL, 't'},
 	{"usage", no_argument, NULL, 0},
 	{NULL, 0, NULL, 0}
 };
-static const char *short_options = "hV";
+static const char *short_options = "hVt:";
 
 static void usage(const char * const argv0)
 {
@@ -56,6 +59,7 @@ static void usage(const char * const argv0)
 	printf("\n");
 	printf("\t-h|--help\n");
 	printf("\t-V|--version\n");
+	printf("\t-t|--timeout\n");
 	printf("\t--usage\n");
 	printf("\n");
 }
@@ -77,85 +81,13 @@ static void help(const char * const argv0)
 
 }
 
-/* Replace '\n' with '\r', aka `tr '\012' '\015'` */
-static bool tr_lf_cr(const char *s)
-{
-	char *p;
-	p = strchr(s, '\n');
-	if (p == NULL || p[1] != '\0') {
-		return false;
-	}
-	*p = '\r';
-	return true;
-}
-
-static void strip_cr(char *s)
-{
-	char *from, *to;
-	from = to = s;
-	while (*from != '\0') {
-		if (*from == '\r') {
-			from++;
-			continue;
-		}
-		*to++ = *from++;
-	}
-	*to = '\0';
-}
-
-static bool is_final_result(const char * const response)
-{
-#define STARTS_WITH(a, b) ( strncmp((a), (b), strlen(b)) == 0)
-	switch (response[0]) {
-	case '+':
-		if (STARTS_WITH(&response[1], "CME ERROR:")) {
-			return true;
-		}
-		if (STARTS_WITH(&response[1], "CMS ERROR:")) {
-			return true;
-		}
-		return false;
-	case 'B':
-		if (strcmp(&response[1], "USY\r\n") == 0) {
-			return true;
-		}
-		return false;
-
-	case 'E':
-		if (strcmp(&response[1], "RROR\r\n") == 0) {
-			return true;
-		}
-		return false;
-	case 'N':
-		if (strcmp(&response[1], "O ANSWER\r\n") == 0) {
-			return true;
-		}
-		if (strcmp(&response[1], "O CARRIER\r\n") == 0) {
-			return true;
-		}
-		if (strcmp(&response[1], "O DIALTONE\r\n") == 0) {
-			return true;
-		}
-		return false;
-	case 'O':
-		if (strcmp(&response[1], "K\r\n") == 0) {
-			return true;
-		}
-		/* no break */
-	default:
-		return false;
-	}
-
-}
-
 int main(int argc, char *argv[])
 {
 	FILE *atcmds;
 	FILE *modem;
 	FILE *output;
-	char *line;
-	bool success;
-	int res;
+	char *line, c;
+	int res, modemfd, timer;
 
 	while (true) {
 		int option_index = 0;
@@ -166,6 +98,9 @@ int main(int argc, char *argv[])
 			break;
 		}
 		switch (c) {
+		case 't':
+			timeout = atoi(optarg);
+			break;
 		case 'h':
 			help(argv[0]);
 			return EXIT_SUCCESS;
@@ -216,6 +151,8 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "fopen(%s) failed: %s\n", MODEM_DEVICE, strerror(errno));
 		return EXIT_FAILURE;
 	}
+	modemfd = fileno(modem);
+	fcntl(modemfd, F_SETFL, fcntl(modemfd, F_GETFL, 0) | O_NONBLOCK);
 
 	if (strcmp(OUTPUT_FILE, "-") == 0) {
 		output = stdout;
@@ -229,30 +166,27 @@ int main(int argc, char *argv[])
 
 	goto start;
 	while (line != NULL) {
-		success = tr_lf_cr(line);
-		if (! success) {
-			fprintf(stderr, "invalid string: '%s'\n", line);
-			return EXIT_FAILURE;
-		}
 		res = fputs(line, modem);
 		if (res < 0) {
 			fprintf(stderr, "failed to send '%s' to modem (res = %d)\n", line, res);
 			return EXIT_FAILURE;
 		}
+		timer = 0;
 		do {
-			line = fgets(buf, (int)sizeof(buf), modem);
-			if (line == NULL) {
-				fprintf(stderr, "EOF from modem\n");
-				return EXIT_FAILURE;
+			c = fgetc(modem);
+			if(c == EOF) {
+				if(timer++ >= timeout)
+					break;
+
+				sleep(1);
+				continue;
 			}
-			strcpy(buf2, line);
-			strip_cr(buf2);
-			res = fputs(buf2, output);
+			res = fputc(c, output);
 			if (res < 0) {
-				fprintf(stderr, "failed to write '%s' to output file (res = %d)\n", buf2, res);
+				fprintf(stderr, "failed to write '%c' to output file (res = %d)\n", c, res);
 				return EXIT_FAILURE;
 			}
-		} while (! is_final_result(line));
+		} while (true);
 start:
 		line = fgets(buf, (int)sizeof(buf), atcmds);
 	}
@@ -278,4 +212,3 @@ start:
 	}
 	return EXIT_SUCCESS;
 }
-
